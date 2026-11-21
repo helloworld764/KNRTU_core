@@ -1,0 +1,167 @@
+"""
+middlewares/subscription_check.py
+
+Middleware — проверяет активную подписку.
+Без подписки доступны ТОЛЬКО: Услуги, Кошелёк, Профиль, Регистрация.
+Администраторы из ADMIN_IDS — всегда без ограничений.
+
+ИСПРАВЛЕНИЕ: сообщения из группчатов (group/supergroup) пропускаются без
+проверки подписки — ими занимается handlers/group_chat.py со своей логикой.
+"""
+
+from typing import Callable, Dict, Any, Awaitable
+
+from aiogram import BaseMiddleware
+from aiogram.types import TelegramObject, CallbackQuery, Message
+
+from database.billing_models import has_active_subscription
+from database.models import is_registered
+from database.models import is_banned
+from handlers.admin import ADMIN_IDS
+
+
+# Callback-данные, разрешённые без подписки
+ALLOWED_CALLBACKS = {
+    "back_to_main",
+    "personal",
+    "profile",
+    "user_data",
+    "backward_to_profile",
+    "profile_view",
+    "profile_delete",
+    "profile_delete_confirm",
+    "services",
+    "backward_to_services",
+    "print",
+    "paid_works",
+    "backward_to_paid_works",
+    "presentation",
+    "backward_to_presentation",
+    "pr_1", "pr_2", "pr_3", "pr_4", "pr_5",
+    "wallet_view",
+    "wallet_topup",
+    "wallet_buy_plan",
+    "wallet_withdraw",
+    "noop",
+    "trial_activate",
+}
+
+# Префиксы callback, разрешённые без подписки
+ALLOWED_PREFIXES = (
+    "buy_plan_",
+    "confirm_plan_",
+    "enter_promo_",
+    "order_pr_",
+    "reg_",
+    "policy_",
+    "check_ok_",
+    "check_edit_",
+)
+
+# Команды, всегда разрешённые
+ALLOWED_COMMANDS = {"/start", "/cancel", "/help", "/wallet", "/reg_group"}
+
+LOCKED_MESSAGE = (
+    "🔒 <b>Доступ ограничен</b>\n\n"
+    "Для использования этой функции необходима активная подписка.\n\n"
+    "Перейди в раздел <b>Кошелёк</b>, пополни баланс и активируй тариф.\n\n"
+    "/wallet — открыть кошелёк"
+)
+
+
+class SubscriptionMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: Dict[str, Any],
+    ) -> Any:
+        user_id = None
+
+        if isinstance(event, (CallbackQuery, Message)):
+            user_id = event.from_user.id
+
+        if user_id is None:
+            return await handler(event, data)
+
+        # ✅ ГРУППОВЫЕ ЧАТЫ — пропускаем без проверки подписки.
+        # Группы обрабатывает handlers/group_chat.py со своей логикой вкл/выкл.
+        # Проверять подписку каждого участника группы — бессмысленно и вредно.
+        if isinstance(event, Message):
+            chat_type = getattr(event.chat, "type", "private")
+            if chat_type in ("group", "supergroup"):
+                return await handler(event, data)
+
+        # Администраторы — полный доступ
+        if user_id in ADMIN_IDS:
+            return await handler(event, data)
+
+        # Незарегистрированные — пускаем (registration сам разберётся)
+        registered = await is_registered(user_id)
+        if not registered:
+            return await handler(event, data)
+
+        # 🔴 Проверка бана
+        if await is_banned(user_id):
+            if isinstance(event, Message):
+                await event.answer("🚫 <b>Вы заблокированы</b>", parse_mode='HTML')
+            elif isinstance(event, CallbackQuery):
+                await event.answer("🚫 Вы заблокированы", show_alert=True)
+            return
+
+        # Проверка подписки
+        has_sub = await has_active_subscription(user_id)
+        if has_sub:
+            return await handler(event, data)
+
+        if isinstance(event, CallbackQuery):
+            if event.data == "trial_activate":
+                return await handler(event, data)
+
+        # ─── Нет подписки ───────────────────────────────────────────
+
+        if isinstance(event, Message):
+            text = (event.text or "").strip()
+
+            # Разрешаем команды
+            if any(text.startswith(cmd) for cmd in ALLOWED_COMMANDS):
+                return await handler(event, data)
+
+            # Разрешаем ввод данных в активном FSM-состоянии
+            state = data.get("state")
+            if state:
+                current = await state.get_state()
+                if current:
+                    return await handler(event, data)
+
+            # Блокируем
+            await event.answer(LOCKED_MESSAGE, parse_mode='HTML')
+            return
+
+        if isinstance(event, CallbackQuery):
+            cb_data = event.data or ""
+
+            if cb_data in ALLOWED_CALLBACKS:
+                return await handler(event, data)
+
+            if any(cb_data.startswith(p) for p in ALLOWED_PREFIXES):
+                return await handler(event, data)
+
+            await event.answer(
+                "🔒 Нужна активная подписка.\n"
+                "Перейди: Кошелёк → Купить тариф",
+                show_alert=True
+            )
+            return
+
+        return await handler(event, data)
+
+
+# ─── Вспомогательная функция ─────────────────────────────────────
+
+async def check_sub(user_id, message):
+    from database.billing_models import has_active_subscription
+    if not await has_active_subscription(user_id):
+        await message.answer("❌ <b>Сначала оплатите подписку</b>", parse_mode='HTML')
+        return False
+    return True

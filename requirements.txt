@@ -1,0 +1,7 @@
+aiogram
+aiohttp
+python-dotenv
+motor
+yandex-ai-studio-sdk
+aiohttp-socks
+yt-dlp
